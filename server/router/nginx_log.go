@@ -1,4 +1,4 @@
-package api
+package router
 
 import (
 	"encoding/json"
@@ -7,9 +7,8 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/0xJacky/Nginx-UI/server/api"
 	"github.com/0xJacky/Nginx-UI/server/model"
-	"github.com/0xJacky/Nginx-UI/server/pkg/nginx"
-	"github.com/0xJacky/Nginx-UI/server/settings"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/hpcloud/tail"
@@ -34,32 +33,32 @@ type nginxLogPageResp struct {
 	Page    int64  `json:"page"`
 }
 
-func GetNginxLogPage(c *gin.Context, srv model.Service) {
+func (h *Handler) GetNginxLogPage(c *gin.Context) {
 	page := cast.ToInt64(c.Query("page"))
 	if page < 0 {
 		page = 0
 	}
 
 	var req controlStruct
-	if !BindAndValid(c, &req) {
+	if !api.BindAndValid(c, &req) {
 		return
 	}
 
-	l, err := getLog(srv, req.LogName)
+	l, err := getLog(h.Srv, req.LogName)
 	if err != nil {
 		c.JSON(http.StatusOK, nginxLogPageResp{})
 		log.Println("error GetNginxLogPage getLog", err)
 		return
 	}
 
-	f, err := os.Open(l.Name)
+	f, err := os.Open(l.Path)
 	if err != nil {
 		c.JSON(http.StatusOK, nginxLogPageResp{})
 		log.Println("error GetNginxLogPage open file", err)
 		return
 	}
 
-	logFileStat, err := os.Stat(l.Name)
+	logFileStat, err := os.Stat(l.Path)
 	if err != nil {
 		c.JSON(http.StatusOK, nginxLogPageResp{})
 		log.Println("error GetNginxLogPage stat", err)
@@ -101,64 +100,6 @@ func GetNginxLogPage(c *gin.Context, srv model.Service) {
 	})
 }
 
-func getLogPath(control *controlStruct) (logPath string, err error) {
-	switch control.Type {
-	case "site":
-		var config *nginx.NgxConfig
-		path := nginx.GetConfPath("sites-available", control.ConfName)
-		config, err = nginx.ParseNgxConfig(path)
-		if err != nil {
-			err = errors.Wrap(err, "error parsing ngx config")
-			return
-		}
-
-		if control.ServerIdx >= len(config.Servers) {
-			err = errors.New("serverIdx out of range")
-			return
-		}
-
-		if control.DirectiveIdx >= len(config.Servers[control.ServerIdx].Directives) {
-			err = errors.New("DirectiveIdx out of range")
-			return
-		}
-
-		directive := config.Servers[control.ServerIdx].Directives[control.DirectiveIdx]
-
-		switch directive.Directive {
-		case "access_log", "error_log":
-			// ok
-		default:
-			err = errors.New("directive.Params neither access_log nor error_log")
-			return
-		}
-
-		if directive.Params == "" {
-			err = errors.New("directive.Params is empty")
-			return
-		}
-
-		logPath = directive.Params
-
-	case "error":
-		if settings.NginxLogSettings.ErrorLogPath == "" {
-			err = errors.New("settings.NginxLogSettings.ErrorLogPath is empty," +
-				" see https://github.com/0xJacky/nginx-ui/wiki/Nginx-Log-Configuration for more information")
-			return
-		}
-		logPath = settings.NginxLogSettings.ErrorLogPath
-
-	default:
-		if settings.NginxLogSettings.AccessLogPath == "" {
-			err = errors.New("settings.NginxLogSettings.AccessLogPath is empty," +
-				" see https://github.com/0xJacky/nginx-ui/wiki/Nginx-Log-Configuration for more information")
-			return
-		}
-		logPath = settings.NginxLogSettings.AccessLogPath
-	}
-
-	return logPath, nil
-}
-
 func getLog(s model.Service, name string) (l model.Log, err error) {
 	if err := s.DB.Where("name = ?", name).First(&l).Error; err != nil {
 		return model.Log{}, err
@@ -166,7 +107,7 @@ func getLog(s model.Service, name string) (l model.Log, err error) {
 	return l, err
 }
 
-func tailNginxLog(ws *websocket.Conn, controlChan chan controlStruct, errChan chan error) {
+func tailNginxLog(ws *websocket.Conn, controlChan chan controlStruct, errChan chan error, s model.Service) {
 	defer func() {
 		if err := recover(); err != nil {
 			log.Println("tailNginxLog recovery", err)
@@ -180,9 +121,10 @@ func tailNginxLog(ws *websocket.Conn, controlChan chan controlStruct, errChan ch
 	}()
 
 	control := <-controlChan
+	log.Println("control....", control)
 
 	for {
-		logPath, err := getLogPath(&control)
+		log, err := getLog(s, control.LogName)
 		if err != nil {
 			errChan <- err
 			return
@@ -194,7 +136,7 @@ func tailNginxLog(ws *websocket.Conn, controlChan chan controlStruct, errChan ch
 		}
 
 		// Create a tail
-		t, err := tail.TailFile(logPath, tail.Config{Follow: true,
+		t, err := tail.TailFile(log.Path, tail.Config{Follow: true,
 			ReOpen: true, Location: &seek})
 
 		if err != nil {
@@ -258,7 +200,7 @@ func handleLogControl(ws *websocket.Conn, controlChan chan controlStruct, errCha
 	}
 }
 
-func NginxLog(c *gin.Context) {
+func (h *Handler) NginxLog(c *gin.Context) {
 	var upGrader = websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			return true
@@ -275,7 +217,7 @@ func NginxLog(c *gin.Context) {
 	errChan := make(chan error, 1)
 	controlChan := make(chan controlStruct, 1)
 
-	go tailNginxLog(ws, controlChan, errChan)
+	go tailNginxLog(ws, controlChan, errChan, h.Srv)
 	go handleLogControl(ws, controlChan, errChan)
 
 	if err = <-errChan; err != nil {

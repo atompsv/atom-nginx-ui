@@ -8,3 +8,5 @@ dist
 *.exe
 *.po~
 nginx-ui
+package-lock.json
+atom-db.db
